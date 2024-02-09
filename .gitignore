@@ -45,3 +45,7 @@ Rplots.pdf
 # Snakemake files
 .snakemake
 logs/
+
+.quarto/
+_site
+
