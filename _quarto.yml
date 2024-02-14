@@ -1,0 +1,32 @@
+project:
+  type: website
+  render:
+    - "testing.qmd"
+    - "index.qmd"
+    - "!scratch/"
+
+website:
+  title: "Biofilm Prediction Stuff"
+  navbar:
+    left:
+      - href: index.qmd
+        text: Home
+      - href: testing.qmd
+        text: CV EDA
+
+execute:
+  warning: false
+  message: false
+
+format:
+  html:
+    theme: cosmo
+    css: styles.css
+    toc: true
+    code-background: true
+    code-copy: true
+    code-fold: true
+
+
+
+

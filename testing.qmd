@@ -1,0 +1,755 @@
+---
+title: "Biofilm data EDA"
+format: 
+    html:
+        toc: true
+date: last-modified
+code-annotations: hover
+---
+
+# Setup
+
+```{r}
+#| code-summary: "Loading libraries, helper functions, setting themes"
+library(tidyverse)
+library(readxl)
+library(MetBrewer)
+library(ggtext)
+library(ggridges)
+
+theme_set(
+    theme_light() +
+        theme(
+            panel.grid.minor = element_blank(),
+            strip.text = element_text(color = "black", size = 12),
+            strip.background = element_rect(fill = "gray80"),
+            panel.border = element_blank()
+        )
+)
+
+serotype_labeller <- function(variable) { # <1>
+    total_count <- table(samples_df$serotype)[variable] # <1>
+    paste0(variable, " (n = ", total_count, ")") # <1>
+} # <1>
+
+nice_expansion <- expansion(add = 0, mult = c(0, 0.1)) # <2>
+
+plate_labeller <- function(plate_string) { # <3>
+    plate_date <- format(as.Date(str_replace(plate_string, "_72h", ""), format = "%d%b%y"), "%b. %d, %Y") # <3>
+    this_label <- str_sub(plate_string, -1) # <3>
+    plate_date <- case_when( # <3>
+        this_label %in% c("A", "B", "C") ~ paste(plate_date, this_label), # <3>
+        TRUE ~ plate_date # <3>
+    ) # <3>
+
+    return(plate_date) # <3>
+} # <3>
+
+categorize_biofilm_formation <- function(cv_reading, sd_vbe, base = 0) { # <4>
+    case_when( # <4>
+        cv_reading < base + sd_vbe ~ "non-former", # <4>
+        between(cv_reading, base + sd_vbe, base + 2 * sd_vbe) ~ "weak", # <4>
+        between(cv_reading, base + 2 * sd_vbe, base + 4 * sd_vbe) ~ "moderate", # <4>
+        cv_reading > base + 4 * sd_vbe ~ "strong" # <4>
+    ) # <4>
+} # <4>
+
+```
+
+1. Labeller function to put serovar counts in strip titles when facetting
+2. Custom expansion to remove space from beneath continuous values
+3. Function to nicely format plate labels. Example: `01dec23_72h_A` becomes `Dec. 01, 2023 A`
+4. Categorizes the biofilm formation on the sample based on Shawn's scheme.
+
+# Reading in data
+
+Data current as of `r format(Sys.time(), "%b %e, %Y")`.
+
+```{r}
+#| code-fold: false
+#| code-summary: "Crystal-violet stain measurements"
+sbfp_data <- read_xlsx("data/salCVbiofilmStudyTracking.xlsx") %>% # <1>
+    janitor::clean_names() %>% # <1>
+    mutate(
+        across(
+            c(starts_with(c("cv_", "blank_")), "mean", "std_dev"),
+            as.numeric
+        )
+    )
+
+metadata <- read_tsv("data/metadata.txt") %>% # <2>
+    janitor::clean_names() # <2>
+
+samples_df <- right_join( # <3>
+    metadata, # <3>
+    sbfp_data %>% filter(str_detect(source_id, "18-|19-")), # <3>
+    by = c("sample" = "source_id") # <3>
+) %>% # <3>
+    filter(!is.na(mean)) # <4>
+```
+
+1. This is the full crystal-violet stain dataset from Laura, including everything all the controls and unfinished samples.
+2. The metadata file containing species and serovar information.
+3. Only get sample information for our isolates...
+4. ...and only for those that have been finished.
+
+# Serovar/specices counts
+
+Distribution of serotypes:
+
+```{r}
+#| code-summary: "Helper function for plotting sample counts by factor"
+plot_counts_by_factor <- function(var, title_string) {
+    this_title <- paste("Number of samples by", title_string)
+
+    samples_df %>%
+        count({{ var }}) %>%
+        mutate(
+            {{ var }} := fct_reorder({{ var }}, n)
+        ) %>%
+        ggplot(aes({{ var }}, n)) +
+        geom_col(color = "black") +
+        geom_text(aes(label = n), vjust = -0.5) +
+        labs(
+            x = title_string,
+            y = "# samples",
+            title = this_title
+        ) +
+        theme(
+            panel.grid.major.x = element_blank(),
+            plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+            axis.line.x = element_line(color = "black", linewidth = 1),
+            axis.text.x = element_text(size = 12, angle = 45, hjust = 1),
+        ) +
+        scale_y_continuous(
+            expand = nice_expansion
+        )
+}
+
+```
+
+```{r}
+plot_counts_by_factor(serotype, "Serotype")
+```
+
+Distribution of source species:
+
+```{r}
+plot_counts_by_factor(source_species, "Species")
+```
+
+Source species by serotype:
+
+```{r}
+samples_df %>%
+    count(source_species, serotype) %>%
+    ggplot(aes(source_species, n)) +
+    geom_col() +
+    facet_wrap(
+        ~serotype,
+        nrow = 2,
+        labeller = labeller(serotype = serotype_labeller)
+    ) +
+    theme(
+        panel.grid.major.x = element_blank(),
+        axis.text.x = element_text(size = 12, angle = 45, hjust = 1),
+    ) +
+    labs(
+        x = "Source Species",
+        y = "# Samples"
+    ) +
+    scale_y_continuous(expand = nice_expansion)
+```
+
+# Calculating per-plate VBE averages
+
+From Shawn's protocol:
+
+> Determine biofilm production using three standard deviations above the mean of the negative OD (OD cut-off, or ODc). A non-biofilm producer is defined as OD < ODc; weak as ODc < OD < 2 x ODc; moderate as 2 x ODc < OD < 4 x ODc; and strong as OD > 4 x ODc.
+
+```{r}
+vbe_summaries <- sbfp_data %>%
+    filter(source_id == "VBE") %>%
+    filter(!is.na(cv_1_od538)) %>%
+    mutate(mean_cv = (cv_1_od538 + cv_2_od538) / 2) %>%
+    group_by(x72_hr_plate) %>%
+    summarise(
+        mean_vbe = mean(mean_cv),
+        sd_vbe = sd(mean_cv),
+        n_vbe = n()
+    ) %>%
+    mutate(
+        plate_label = plate_labeller(x72_hr_plate),
+        plate_label = paste0(plate_label, " (n = ", n_vbe, ")"),
+    )
+```
+
+
+```{r}
+#| eval: false
+#| echo: false
+vbe_summaries %>%
+    select(-plate_label) %>%
+    pivot_longer(-x72_hr_plate) %>%
+    # filter(!str_detect(name, "_sd")) %>%
+    filter(name == "mean_vbe") %>%
+    ggplot(aes(value, x72_hr_plate)) +
+    geom_density_ridges(jittered_points = TRUE) +
+    theme_ridges() +
+    theme(
+        axis.title.y = element_text(hjust = 0.5)
+    ) +
+    labs(
+        y = "Plate",
+        x = "Mean OD"
+    )
+```
+
+
+## OD Distributions
+
+Distribution of mean OD across all samples. 
+```{r}
+#| label: fig-mean-od-hist
+#| fig-cap: "Distribution of mean ODs. Dashed red vertical lines indicate mean $OD_c$, $2OD_c$, and $4OD_c$."
+#| code-summary: "Histogram of mean OD over _all_ samples."
+these_breaks <- seq(0, 2.5, by = 0.1)
+odc_breaks <- mean(vbe_summaries$sd_vbe) * c(1, 2, 4)
+samples_df %>%
+    ggplot(aes(mean)) +
+    geom_histogram(
+        fill = "#CECECE",
+        color = "black",
+        breaks = these_breaks
+    ) +
+    scale_y_continuous(expand = nice_expansion) +
+    scale_x_continuous(
+        breaks = these_breaks[c(TRUE, FALSE)],
+        expand = nice_expansion
+    ) +
+    geom_vline(
+        xintercept = odc_breaks,
+        color = "red",
+    ) +
+    theme(
+        panel.grid.major.x = element_blank(),
+        plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+    ) +
+    labs(
+        x = "Mean OD",
+        y = "# Samples",
+        title = "Distribution of mean ODs in samples"
+    )
+
+```
+
+Distribution of mean OD by serotype
+```{r}
+#| label: fig-mean-od-hist-by-serotype
+#| fig-cap: "Distribution of mean ODs by serotype. Dashed red vertical line indicates overall mean OD within that serotype."
+#| code-summary: "Histogram of mean OD _by serotype_"
+samples_df %>%
+    ggplot(aes(mean)) +
+    geom_histogram() +
+    scale_y_continuous(expand = nice_expansion) +
+    theme(
+        panel.grid.major.x = element_blank(),
+        plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+    ) +
+    labs(
+        x = "Mean OD",
+        y = "# Samples",
+        title = "Distribution of mean ODs in samples"
+    ) +
+    facet_wrap(
+        ~serotype
+    ) +
+    geom_vline(
+        data = samples_df %>%
+            group_by(serotype) %>%
+            summarise(
+                mean = mean(mean)
+            ),
+        aes(xintercept = mean),
+        color = "red",
+        linetype = "dashed"
+    )
+```
+
+We can perhaps see some differnces in mean OD by serotype:
+```{r}
+#| code-summary: "Boxplot"
+samples_df %>%
+    ggplot(aes(serotype, mean)) +
+    geom_boxplot()
+
+```
+
+We'll test for significant differences in mean OD by serotype using ANOVA.
+
+```{r}
+#| code-summary: "ANOVA"
+anova_results <- aov(
+    mean ~ serotype,
+    data = samples_df
+)
+
+summary(anova_results)
+```
+
+ANOVA shows that mean OD significantly differs based on Serotype ($p \approx 4.41e-10$). 
+We'll use a Tukey post-hoc test to determine where these significant differences are.
+Since `TukeyHSD` already does multiple testing correction, we'll just use $\alpha = 0.05$ here.
+```{r}
+#| code-summary: "TukeyHSD"
+tukey_results <- TukeyHSD(anova_results)
+
+p_thresh <- 0.05
+
+tukey_results$serotype %>%
+    as.data.frame() %>%
+    janitor::clean_names() %>%
+    rownames_to_column("contrast") %>%
+    filter(p_adj < p_thresh) %>%
+    select(contrast, p_adj)
+```
+
+So we see that all comparisons are significant at $\alpha = 0.05$, with some comparisons being more statistically significant than others. 
+
+
+
+
+## Writing out prepped sample data 
+```{r}
+plot(tukey_results)
+```
+
+### Some scratch
+
+```{r}
+#| fig-cap: "Mean $OD_538$ and standard deviation of $OD_538$ by plate"
+#| code-summary: "Plotting mean OD and standard deviation by plate"
+vbe_summaries %>%
+    ggplot(aes(plate_label, mean_vbe)) +
+    geom_point() +
+    geom_errorbar(aes(ymin = mean_vbe - sd_vbe, ymax = mean_vbe + sd_vbe), width = 0.2) +
+    theme(
+        panel.grid.major.x = element_blank(),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)
+    )
+```
+
+```{r}
+#| fig-cap: "Histogram of SDs * n for each plate."
+vbe_summaries %>%
+    mutate(
+        biofilm_sd = n_vbe * sd_vbe
+    ) %>%
+    pivot_longer(
+        contains("sd")
+    ) %>%
+    ggplot(aes(value)) +
+    geom_histogram() +
+    facet_wrap(~name, scales = "free") +
+    theme(
+        panel.grid.major.x = element_blank(),
+    ) +
+    scale_y_continuous(expand = nice_expansion)
+```
+
+```{r}
+samples_df %>%
+    left_join(
+        vbe_summaries,
+        by = c("x72_hr_plate" = "x72_hr_plate")
+    ) %>%
+    mutate(
+        biofilm_category = categorize_biofilm_formation(mean, sqrt(n_vbe) * sd_vbe)
+    ) %>%
+    count(biofilm_category)
+# mutate(biofilm_sd = n_vbe * sd_vbe) %>%
+#     ggplot(aes())
+```
+
+
+```{r}
+samples_df %>%
+    left_join(
+        vbe_summaries,
+        by = c("x72_hr_plate" = "x72_hr_plate")
+    ) %>%
+    mutate(
+        across(
+            starts_with("cv_"),
+            ~ categorize_biofilm_formation(., 3 * sd_vbe),
+            .names = "biofilm_{.col}"
+        ),
+    ) %>%
+    count(biofilm_cv_1_od538, biofilm_cv_2_od538)
+```
+
+
+```{r}
+mean(vbe_summaries$n_vbe)
+```
+
+### Distribution of differences between samples
+
+
+```{r}
+samples_df %>%
+    mutate(sample_diff = cv_1_od538 - cv_2_od538) %>%
+    ggplot(aes(sample_diff)) +
+    geom_histogram(color = "black", fill = "#CECECE") +
+    labs(
+        x = "Difference in OD",
+        y = "# Samples",
+        title = "Difference in OD between replicates"
+    ) +
+    scale_y_continuous(expand = nice_expansion) +
+    theme(
+        panel.grid.major.x = element_blank(),
+        plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+    )
+```
+
+### Positive controls
+
+
+```{r}
+positive_controls <- sbfp_data %>%
+    filter(str_detect(source_id, "^SX240")) %>%
+    mutate(plate_name = str_replace(x72_hr_plate, "_72h.*", "")) %>%
+    pivot_longer(
+        starts_with("cv_")
+    ) %>%
+    group_by(plate_name) %>%
+    summarise(
+        mean_cv = mean(value),
+        sd_cv = sd(value),
+        n = n()
+    ) %>%
+    mutate(
+        sample_date = as.Date(plate_name, format = "%d%b%y")
+    )
+
+overall_sx240_mean <- sbfp_data %>%
+    filter(str_detect(source_id, "^SX240")) %>%
+    pivot_longer(
+        starts_with("cv_")
+    ) %>%
+    pull(value) %>%
+    mean()
+
+overall_sx240_sd <- sbfp_data %>%
+    filter(str_detect(source_id, "^SX240")) %>%
+    pivot_longer(
+        starts_with("cv_")
+    ) %>%
+    pull(value) %>%
+    sd()
+```
+
+```{r}
+sbfp_data %>%
+    filter(str_detect(source_id, "^SX240")) %>%
+    view()
+```
+
+### Standard deviations
+```{r}
+all_sds <- bind_rows(
+    data.frame(
+        sd_cv = positive_controls$sd_cv,
+        type = "sx240"
+    ),
+    data.frame(
+        sd_cv = samples_df$std_dev,
+        type = "samples"
+    )
+)
+
+overall_mean_sd <- mean(all_sds$sd_cv)
+overall_sd_sd <- sd(all_sds$sd_cv)
+
+vline_breaks <- c(-2, -1, 1, 2) * overall_sd_sd + overall_mean_sd
+sd_labels <- data.frame(
+    y = vline_breaks,
+    label = c(
+        "-2 SD", "-1 SD", "+1 SD", "+2 SD"
+    )
+)
+
+all_sds %>%
+    arrange(sd_cv) %>%
+    mutate(id = row_number()) %>%
+    ggplot(aes(id, sd_cv)) +
+    geom_hline(
+        yintercept = vline_breaks[2:4],
+        linetype = "dashed",
+        color = "gray50"
+    ) +
+    geom_hline(
+        yintercept = overall_mean_sd,
+        color = "black",
+        linewidth = 1.5,
+        linetype = "dashed"
+    ) +
+    geom_point(
+        aes(
+            size = if_else(type == "sx240", 6, 1),
+            fill = type,
+            alpha = if_else(type == "sx240", 1, 0.5),
+        ),
+        shape = 21,
+    ) +
+    scale_y_continuous(expand = nice_expansion) +
+    scale_x_continuous(expand = nice_expansion) +
+    theme(
+        panel.grid.major.x = element_blank(),
+        axis.ticks = element_blank(),
+        axis.text.x = element_blank(),
+        plot.title = element_text(hjust = 0.5, size = 14),
+        axis.line.x = element_line(color = "black", linewidth = 0.5),
+    ) +
+    geom_text(
+        data = sd_labels %>% slice_tail(n = 3),
+        aes(nrow(all_sds), y, label = label),
+        inherit.aes = FALSE,
+        nudge_y = 0.02
+    ) +
+    geom_text(
+        data = NULL,
+        inherit.aes = FALSE,
+        aes(nrow(all_sds), overall_mean_sd + 0.02, label = "Overall mean SD")
+    ) +
+    scale_fill_manual(values = met.brewer("Kandinsky")) +
+    labs(
+        x = "",
+        y = "Standard deviation",
+        fill = "",
+        title = "Standard deviations of CV readings",
+    ) +
+    guides(
+        size = "none",
+        alpha = "none"
+    )
+
+```
+
+### QQ plot of SDs 
+
+```{r}
+qqnorm(all_sds$sd_cv)
+qqline(all_sds$sd_cv)
+```
+
+### Checking missing samples
+
+```{r}
+ars_missing_isolates <- read_xlsx("data/ARS requested isolates copy.xlsx") %>%
+    janitor::clean_names() %>%
+    filter(is.na(box)) %>%
+    rename(source_id = text_id)
+
+missing_isolates_from_metadata <- anti_join(
+    metadata,
+    samples_df,
+    by = c("sample" = "sample")
+)
+```
+
+
+```{r}
+missing_isolates_from_metadata %>%
+    filter(!sample %in% ars_missing_isolates$source_id) %>%
+    pull(sample)
+```
+
+```{r}
+ars_missing_isolates %>%
+    filter(!source_id %in% missing_isolates_from_metadata$sample) %>%
+    pull(source_id)
+```
+
+
+```{r}
+metadata %>%
+    filter(sample %in% c("18-038875-007", "18-038877-080"))
+```
+
+
+```{r}
+samples_df %>%
+    filter(sample %in% c("18-038875-007", "18-038877-080"))
+```
+
+
+```{r}
+anti_join(
+    samples_df,
+    metadata,
+    by = c("sample" = "sample")
+)
+```
+
+
+```{r}
+inner_join( # <3>
+    metadata, # <3>
+    sbfp_data, # <3>
+    by = c("sample" = "source_id") # <3>
+) %>% # <3>
+    filter(!is.na(mean))
+```
+
+
+```{r}
+sbfp_data %>%
+    filter(str_detect(source_id, "18-|19-"))
+```
+
+
+```{r}
+recent_metadata <- read_xlsx("data/nvsl_fsep_salmonella_collection.xlsx") %>%
+    janitor::clean_names() %>%
+    rename(source_id = nvsl_internal_id)
+```
+
+
+```{r}
+recent_metadata %>%
+    filter(source_id %in% ars_missing_isolates$source_id)
+```
+
+
+```{r}
+# For every
+# for (samp in samples_df$sample) {
+#     if (length(list.files("data/all_genomes", pattern = paste0("^", samp))) == 0) {
+#         print(samp)
+#     }
+# }
+```
+
+# Categorization schemes
+
+The `positive_controls` df contains the mean and sd of cv values for the positive controls.
+```{r}
+#| code-summary: "Mean and sd of positive controls"
+#| fig-cap: "Mean and standard deviation of the SX240 samples by plate. SD and mean are calculated after aggregating by the date of the 72 hour plate."
+
+
+positive_controls %>%
+    mutate(
+        plot_label = paste0(
+            format(sample_date, "%b. %d, %Y"),
+            "\n(n = ", n, ")"
+        )
+    ) %>%
+    mutate(plot_label = fct_reorder(plot_label, sample_date)) %>%
+    ggplot(aes(plot_label, mean_cv)) +
+    geom_point() +
+    geom_errorbar(aes(ymin = mean_cv - sd_cv, ymax = mean_cv + sd_cv), width = 0.2) +
+    geom_hline(
+        yintercept = overall_sx240_mean,
+        color = "red",
+        linetype = "dashed"
+    ) +
+    geom_label(
+        label = "Overall mean",
+        x = 2,
+        y = overall_sx240_mean + 0.03,
+        color = "red"
+    ) +
+    theme(
+        panel.grid.major.x = element_blank(),
+        axis.line.x = element_line(color = "gray80", linewidth = 0.5),
+        axis.ticks.x = element_blank(),
+        plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+    ) +
+    labs(
+        x = "",
+        y = "Mean OD (± SD)",
+        title = "Mean SD by plate"
+    )
+```
+
+
+```{r}
+sx240_sd_breaks <- c(-2, -1, 1, 2) * overall_sx240_sd + overall_sx240_mean
+
+samples_df %>%
+    ggplot(aes(mean)) +
+    geom_histogram(
+        fill = "#CECECE",
+        color = "black",
+        breaks = these_breaks
+    ) +
+    scale_y_continuous(expand = nice_expansion) +
+    scale_x_continuous(
+        breaks = these_breaks[c(TRUE, FALSE)],
+        expand = nice_expansion
+    ) +
+    geom_vline(
+        xintercept = overall_sx240_mean,
+        color = "red",
+        linetype = "dashed",
+        linewidth = 2
+    ) +
+    geom_vline(
+        xintercept = sx240_sd_breaks,
+        color = "red",
+        linetype = "dashed",
+        linewidth = 1
+    ) +
+    theme(
+        panel.grid.major.x = element_blank(),
+        plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+    ) +
+    labs(
+        x = "Mean OD",
+        y = "# Samples",
+        title = "Distribution of mean ODs in samples"
+    )
+```
+
+
+```{r}
+samples_df %>%
+    mutate(
+        biofilm_category = case_when(
+            mean < sx240_sd_breaks[1] ~ "weak",
+            between(mean, sx240_sd_breaks[1], sx240_sd_breaks[4]) ~ "moderate",
+            mean > sx240_sd_breaks[4] ~ "strong"
+        )
+    ) %>%
+    count(biofilm_category)
+```
+
+
+```{r}
+samples_df %>%
+    mutate(id = row_number()) %>%
+    ggplot(aes(id, mean)) +
+    geom_point() +
+    geom_hline(
+        yintercept = sx240_sd_breaks,
+        color = "red",
+        linetype = "dashed"
+    ) +
+    geom_hline(
+        yintercept = overall_sx240_mean,
+        color = "red",
+        linetype = "dashed",
+        linewidth = 2
+    ) +
+    theme(
+        panel.grid.major.x = element_blank(),
+        axis.text.x = element_blank()
+    ) +
+    labs(
+        x = "",
+        n = "Mean OD"
+    )
+```

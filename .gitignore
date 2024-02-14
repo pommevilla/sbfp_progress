@@ -49,3 +49,5 @@ logs/
 .quarto/
 _site
 
+
+/.quarto/
